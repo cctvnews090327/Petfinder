@@ -1,0 +1,768 @@
+-- gag2_pets_mobile.lua
+-- GAG2 Pet Finder — MOBILE BUILD
+-- Changes from PC version:
+--   1. Mobile-sized UI (compact, touch-friendly, draggable header, minimize toggle)
+--   2. Fixed "TPs to pet then bounces back" — character is now anchored + CFrame is
+--      re-enforced every frame while taming, and the prompt's part is dragged onto us
+--      continuously, not just once.
+--   3. Server hop now filters out full / near-full servers properly and handles
+--      TeleportInitFailed so it auto-skips and tries the next one instead of getting
+--      stuck on a full server.
+--   4. Removed all gear-mailing logic.
+
+-- =====================
+-- CONFIG
+-- =====================
+local TARGETS   = { Raccoon = true, Unicorn = true, GoldenDragonfly = true }
+local MUTATIONS = { Big = true, Huge = true, Rainbow = true }
+local HOP_DELAY     = 6
+local MIN_PLAYERS   = 1
+local FULL_BUFFER   = 2     -- need at least this many free slots to consider a server
+local TAME_TIMEOUT  = 20
+local WEBHOOK_URL   = "https://discord.com/api/webhooks/1516033291961106513/6kc8RXhrvg5SygZM5EsSf-VQEg07KHO6EmiNBVV54y2ZGVh_j1sNH1ueHQZhEuN06Xia"
+local WEBHOOK_ENABLED = true
+
+local PRIORITY = {
+    IceSerpent = 1, Raccoon = 2, Unicorn = 3,
+    GoldenDragonfly = 4, Monkey = 5, Bee = 6,
+    BlackDragon = 7, Robin = 8, Deer = 9,
+    Owl = 10, Bunny = 11, Frog = 12,
+}
+
+-- =====================
+-- SERVICES
+-- =====================
+local Players           = game:GetService("Players")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local RunService        = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local lp                = Players.LocalPlayer
+local playerGui         = lp:WaitForChild("PlayerGui")
+
+local net               = require(ReplicatedStorage.SharedModules.Networking)
+local WildPetTame       = net.Pets.WildPetTame
+local WildPetTameResult = net.Pets.WildPetTameResult
+
+-- =====================
+-- STATE
+-- =====================
+local running       = true
+local taming        = false
+local hopping       = false
+local hopCancelled  = false
+local emptyAt       = nil
+local lastHopFrom   = ""
+local cursor        = ""
+local placeId       = game.PlaceId
+
+local visited
+if getgenv then
+    if not getgenv().__PET_VISITED then getgenv().__PET_VISITED = {} end
+    getgenv().__PET_VISITED[game.JobId] = true
+    visited = getgenv().__PET_VISITED
+else
+    visited = { [game.JobId] = true }
+end
+
+-- =====================
+-- BALANCE
+-- =====================
+local leaderstats = lp:WaitForChild("leaderstats", 10)
+local shecklesVal = leaderstats and leaderstats:WaitForChild("Sheckles", 10)
+local function getBalance() return shecklesVal and shecklesVal.Value or 0 end
+
+-- =====================
+-- WEBHOOK
+-- =====================
+local function sendWebhook(title, body, color)
+    if not WEBHOOK_ENABLED then return end
+    task.spawn(function()
+        pcall(function()
+            (request or http_request or syn and syn.request)({
+                Url    = WEBHOOK_URL,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = HttpService:JSONEncode({
+                    embeds = {{
+                        title       = title,
+                        description = body,
+                        color       = color or 5763719,
+                        footer      = { text = "GAG2 Pets · " .. lp.Name .. " · " .. game.JobId:sub(1,8) },
+                        timestamp   = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+                    }}
+                })
+            })
+        end)
+    end)
+end
+
+-- =====================
+-- COLORS
+-- =====================
+local C = {
+    bg = Color3.fromRGB(14,14,20), panel = Color3.fromRGB(20,20,28),
+    border = Color3.fromRGB(42,42,58), accent = Color3.fromRGB(90,210,130),
+    accentDim = Color3.fromRGB(30,65,45), text = Color3.fromRGB(215,215,228),
+    muted = Color3.fromRGB(100,100,120), danger = Color3.fromRGB(220,80,80),
+    dangerDim = Color3.fromRGB(70,25,25), gold = Color3.fromRGB(255,195,55),
+    goldDim = Color3.fromRGB(70,52,10), rainbow = Color3.fromRGB(180,100,255),
+    header = Color3.fromRGB(18,18,26),
+}
+local RARITY_COLOR = {
+    Common = Color3.fromRGB(160,160,170), Uncommon = Color3.fromRGB(100,200,100),
+    Rare = Color3.fromRGB(80,140,255), Legendary = Color3.fromRGB(255,180,40),
+    Mythic = Color3.fromRGB(180,100,255), Super = Color3.fromRGB(255,60,60),
+}
+
+-- =====================
+-- UI BUILD (mobile sized)
+-- =====================
+local existing = playerGui:FindFirstChild("GAG2_PETS")
+if existing then existing:Destroy() end
+
+local sg = Instance.new("ScreenGui")
+sg.Name = "GAG2_PETS"
+sg.ResetOnSpawn = false
+sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+sg.IgnoreGuiInset = true
+sg.Parent = playerGui
+
+-- Mobile dimensions: narrower, anchored top-right with safe-area padding
+local WIN_W, WIN_H = 210, 250
+local win = Instance.new("Frame")
+win.Size       = UDim2.new(0, WIN_W, 0, WIN_H)
+win.Position   = UDim2.new(1, -(WIN_W + 8), 0, 40)
+win.BackgroundColor3 = C.bg
+win.BorderSizePixel  = 0
+win.Active     = true
+win.ClipsDescendants = true
+win.Parent     = sg
+local wc = Instance.new("UICorner", win); wc.CornerRadius = UDim.new(0,8)
+local ws = Instance.new("UIStroke",  win); ws.Color = C.border; ws.Thickness = 1
+
+-- Manual touch drag (Draggable is deprecated on mobile)
+do
+    local UIS = game:GetService("UserInputService")
+    local dragging, dragStart, startPos
+    local function isHeaderInput(input)
+        return input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1
+    end
+    win.InputBegan:Connect(function(input)
+        if isHeaderInput(input) and input.Position.Y - win.AbsolutePosition.Y < 30 then
+            dragging = true
+            dragStart = input.Position
+            startPos  = win.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseMovement) then
+            local d = input.Position - dragStart
+            win.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + d.X,
+                startPos.Y.Scale, startPos.Y.Offset + d.Y
+            )
+        end
+    end)
+end
+
+local function mkFrame(parent, size, pos, color, radius)
+    local f = Instance.new("Frame")
+    f.Size = size; f.Position = pos
+    f.BackgroundColor3 = color or C.panel
+    f.BorderSizePixel = 0; f.Parent = parent
+    if radius then local c = Instance.new("UICorner", f); c.CornerRadius = UDim.new(0, radius) end
+    return f
+end
+
+local function mkLabel(parent, text, size, pos, color, fs, bold)
+    local l = Instance.new("TextLabel")
+    l.Size = size; l.Position = pos
+    l.BackgroundTransparency = 1
+    l.Text = text; l.TextColor3 = color or C.text
+    l.TextSize = fs or 10
+    l.Font = bold and Enum.Font.GothamBold or Enum.Font.GothamMedium
+    l.TextXAlignment = Enum.TextXAlignment.Left
+    l.TextTruncate = Enum.TextTruncate.AtEnd
+    l.Parent = parent
+    return l
+end
+
+local function mkBtn(parent, text, size, pos, bg, fg, cb)
+    local b = Instance.new("TextButton")
+    b.Size = size; b.Position = pos
+    b.BackgroundColor3 = bg; b.BorderSizePixel = 0
+    b.Text = text; b.TextColor3 = fg
+    b.TextSize = 10; b.Font = Enum.Font.GothamBold
+    b.AutoButtonColor = false; b.Parent = parent
+    local c = Instance.new("UICorner", b); c.CornerRadius = UDim.new(0,4)
+    b.MouseButton1Click:Connect(cb)
+    return b
+end
+
+local function mkDiv(parent, y)
+    return mkFrame(parent, UDim2.new(1,-16,0,1), UDim2.new(0,8,0,y), C.border)
+end
+
+local hdr = mkFrame(win, UDim2.new(1,0,0,30), UDim2.new(0,0,0,0), C.header, 8)
+mkLabel(hdr, "🐾  PET FINDER", UDim2.new(1,-100,1,0), UDim2.new(0,10,0,0), C.accent, 11, true)
+
+-- Minimize toggle for mobile (saves screen space)
+local minimized = false
+local minBtn = mkBtn(hdr, "—",
+    UDim2.new(0,28,0,20), UDim2.new(1,-94,0,5),
+    C.border, C.text, function()
+        minimized = not minimized
+        if minimized then
+            win:TweenSize(UDim2.new(0, WIN_W, 0, 30), "Out", "Quad", 0.15, true)
+        else
+            win:TweenSize(UDim2.new(0, WIN_W, 0, WIN_H), "Out", "Quad", 0.15, true)
+        end
+    end)
+
+local stopBtn = mkBtn(hdr, "■ STOP",
+    UDim2.new(0,58,0,20), UDim2.new(1,-62,0,5),
+    C.dangerDim, C.danger, function() end)
+
+local statusLbl = mkLabel(win, "Starting...",
+    UDim2.new(1,-16,0,14), UDim2.new(0,8,0,36), C.accent, 10, true)
+local serverLbl = mkLabel(win, "Server: " .. game.JobId:sub(1,8),
+    UDim2.new(1,-16,0,12), UDim2.new(0,8,0,52), C.muted, 9)
+local balLbl = mkLabel(win, "Balance: —",
+    UDim2.new(1,-16,0,12), UDim2.new(0,8,0,64), C.muted, 9)
+
+mkDiv(win, 80)
+mkLabel(win, "TARGETING", UDim2.new(1,-16,0,12), UDim2.new(0,8,0,86), C.muted, 8, true)
+mkLabel(win, "Raccoon · Unicorn · GoldenDragonfly",
+    UDim2.new(1,-16,0,12), UDim2.new(0,8,0,99), C.text, 9)
+
+local tagY = 116
+local tagData = {
+    { label = "BIG",     fg = C.gold,    bg = C.goldDim },
+    { label = "HUGE",    fg = Color3.fromRGB(255,140,50), bg = Color3.fromRGB(60,32,8) },
+    { label = "RAINBOW", fg = C.rainbow, bg = Color3.fromRGB(45,20,70) },
+}
+local tagX = 8
+for _, t in ipairs(tagData) do
+    local w = t.label == "RAINBOW" and 54 or 34
+    local tf = mkFrame(win, UDim2.new(0,w,0,16), UDim2.new(0,tagX,0,tagY), t.bg, 3)
+    local tst = Instance.new("UIStroke", tf); tst.Color = t.fg; tst.Thickness = 1
+    local tl = Instance.new("TextLabel", tf)
+    tl.Size = UDim2.new(1,0,1,0); tl.BackgroundTransparency = 1
+    tl.Text = t.label; tl.TextColor3 = t.fg
+    tl.TextSize = 8; tl.Font = Enum.Font.GothamBold
+    tagX = tagX + w + 4
+end
+
+mkDiv(win, 138)
+mkLabel(win, "CURRENT TARGET", UDim2.new(1,-16,0,12), UDim2.new(0,8,0,144), C.muted, 8, true)
+local targetNameLbl   = mkLabel(win, "—", UDim2.new(1,-100,0,14), UDim2.new(0,8,0,157), C.text, 10, true)
+local targetRarityLbl = mkLabel(win, "", UDim2.new(0,80,0,14), UDim2.new(1,-88,0,157), C.muted, 9)
+local targetPriceLbl  = mkLabel(win, "", UDim2.new(1,-16,0,12), UDim2.new(0,8,0,172), C.muted, 9)
+local lastTamedLbl    = mkLabel(win, "Last tamed: —", UDim2.new(1,-16,0,12), UDim2.new(0,8,0,186), C.muted, 9)
+
+mkDiv(win, 202)
+local countBg  = mkFrame(win, UDim2.new(1,-16,0,20), UDim2.new(0,8,0,208), C.dangerDim, 4)
+local countBar = mkFrame(countBg, UDim2.new(1,0,1,0), UDim2.new(0,0,0,0), C.danger, 4)
+local countLbl = Instance.new("TextLabel", countBg)
+countLbl.Size = UDim2.new(1,0,1,0); countLbl.BackgroundTransparency = 1
+countLbl.Text = ""; countLbl.TextColor3 = C.danger
+countLbl.TextSize = 9; countLbl.Font = Enum.Font.GothamBold
+countBg.Visible = false
+
+local function setStatus(t, col) statusLbl.Text = t; statusLbl.TextColor3 = col or C.accent end
+
+local function setTarget(refPart, displayName)
+    if not refPart then
+        targetNameLbl.Text = "—"; targetRarityLbl.Text = ""; targetPriceLbl.Text = ""
+        return
+    end
+    local rarity = refPart:GetAttribute("Rarity") or "?"
+    local price  = refPart:GetAttribute("Price") or 0
+    targetNameLbl.Text = displayName
+    targetNameLbl.TextColor3 = RARITY_COLOR[rarity] or C.text
+    targetRarityLbl.Text = rarity
+    targetRarityLbl.TextColor3 = RARITY_COLOR[rarity] or C.muted
+    targetPriceLbl.Text = "🪙 " .. tostring(price) .. "  ·  bal " .. tostring(getBalance())
+end
+
+if shecklesVal then
+    shecklesVal.Changed:Connect(function(v)
+        balLbl.Text = "Balance: " .. tostring(v) .. " 🪙"
+    end)
+    balLbl.Text = "Balance: " .. tostring(getBalance()) .. " 🪙"
+end
+
+stopBtn.MouseButton1Click:Connect(function()
+    running = false; hopCancelled = true; hopping = false
+    countBg.Visible = false
+    setStatus("Stopped", C.danger)
+    stopBtn.BackgroundColor3 = C.border
+    stopBtn.TextColor3 = C.muted
+    stopBtn.Text = "✕ STOP"
+end)
+
+-- =====================
+-- TELEPORT FAILURE HANDLING
+-- =====================
+TeleportService.TeleportInitFailed:Connect(function(player, result, errorMsg)
+    if player ~= lp then return end
+    setStatus("TP failed — retry", C.muted)
+    hopping = false   -- let main loop try the next server
+end)
+
+-- =====================
+-- CORE LOGIC
+-- =====================
+local function shouldTame(refPart)
+    local petName = refPart:GetAttribute("PetName") or ""
+    local ownerID = refPart:GetAttribute("OwnerUserId")
+    if not ownerID or ownerID ~= 0 then return false, nil end
+    local petSize = refPart:GetAttribute("PetSize") or ""
+    local petType = refPart:GetAttribute("PetType") or refPart:GetAttribute("Type") or ""
+    local lower = petName:lower()
+    if MUTATIONS[petSize] then return true, petSize .. " " .. petName end
+    if petType == "Rainbow" and MUTATIONS["Rainbow"] then return true, "Rainbow " .. petName end
+    if lower:find("big ") or lower:find("huge ") or lower:find("rainbow ") then return true, petName end
+    if TARGETS[petName] then return true, petName end
+    return false, nil
+end
+
+local function getMutationTier(refPart)
+    local size = refPart:GetAttribute("PetSize") or ""
+    if size == "Huge" then return 3 end
+    if size == "Big"  then return 2 end
+    if (refPart:GetAttribute("PetType") or "") == "Rainbow" then return 1 end
+    return 0
+end
+
+local function getPriority(refPart)
+    return PRIORITY[refPart:GetAttribute("PetName") or ""] or 99
+end
+
+local function findWildModel(refPart)
+    local spawns = workspace.Map:FindFirstChild("WildPetSpawns")
+    if not spawns then return nil end
+    local uuid = refPart.Name:match("WildPet_(.+)$")
+    if not uuid then return nil end
+    for _, c in ipairs(spawns:GetChildren()) do
+        if c.Name:find(uuid, 1, true) then return c end
+    end
+    return nil
+end
+
+local function findTamePrompt(model)
+    if not model then return nil end
+    local fallback
+    for _, d in ipairs(model:GetDescendants()) do
+        if d:IsA("ProximityPrompt") and d.Enabled then
+            local at = (d.ActionText or "") .. " " .. (d.ObjectText or "")
+            if at:lower():find("tame") then return d end
+            fallback = fallback or d
+        end
+    end
+    return fallback
+end
+
+-- =====================
+-- TAME (mobile-fixed: anchor + continuous re-CFrame to defeat bounce-back)
+-- =====================
+local function tamePet(refPart, displayName)
+    taming = true
+    emptyAt = nil
+    countBg.Visible = false
+
+    local price   = refPart:GetAttribute("Price") or 0
+    local balance = getBalance()
+    if balance < price then
+        setStatus("Can't afford " .. displayName, C.muted)
+        sendWebhook("⚠️ Insufficient Funds",
+            "**Target:** " .. displayName ..
+            "\n**Price:** " .. price ..
+            "\n**Balance:** " .. balance ..
+            "\n**Server:** " .. game.JobId:sub(1,8), 16744272)
+        taming = false
+        return false
+    end
+
+    setTarget(refPart, displayName)
+    setStatus("TPing → " .. displayName, C.gold)
+
+    local char = lp.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    local hum  = char and char:FindFirstChildOfClass("Humanoid")
+    if not hrp or not hum then taming = false; return false end
+
+    -- Pick a stable anchor position: the pet's model RootPart, or the ref part itself
+    local model = findWildModel(refPart)
+    local anchorPart = (model and model:FindFirstChild("RootPart")) or refPart
+    local function anchorCFrame()
+        if anchorPart and anchorPart.Parent then
+            return CFrame.new(anchorPart.Position + Vector3.new(0, 4, 0))
+        end
+        return hrp.CFrame
+    end
+
+    -- Save & override character state so the server can't yank us back
+    local prevAnchored = hrp.Anchored
+    local prevAutoRot  = hum.AutoRotate
+    pcall(function() hum.PlatformStand = true end)
+    pcall(function() hum.AutoRotate    = false end)
+    pcall(function() lp.ReplicationFocus = lp.Character end)
+
+    hrp.CFrame = anchorCFrame()
+    task.wait(0.15)
+    hrp.Anchored = true   -- anchor AFTER the initial CFrame so we don't yo-yo
+
+    -- Heartbeat loop: keep us locked at the anchor + drag prompt's part onto us
+    local stopHB = false
+    local hbConn
+    hbConn = RunService.Heartbeat:Connect(function()
+        if stopHB then if hbConn then hbConn:Disconnect() end return end
+        if not hrp.Parent then return end
+        -- re-lock our position every frame
+        hrp.CFrame = anchorCFrame()
+        -- pull the current prompt's parent onto us so distance checks pass
+        local m = findWildModel(refPart)
+        local p = findTamePrompt(m)
+        if p and p.Parent and p.Parent:IsA("BasePart") then
+            pcall(function() p.Parent.CFrame = hrp.CFrame end)
+        end
+    end)
+
+    local success, sniped = false, false
+    local conn = WildPetTameResult.OnClientEvent:Connect(function()
+        success = true
+    end)
+    local snipeConn
+    snipeConn = refPart:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
+        local newOwner = refPart:GetAttribute("OwnerUserId")
+        if newOwner and newOwner ~= 0 then
+            if newOwner == lp.UserId then success = true else sniped = true end
+        end
+    end)
+
+    setStatus("Taming " .. displayName .. "...", C.gold)
+    local t0 = tick()
+
+    while refPart.Parent and not success and not sniped and running do
+        if tick() - t0 > TAME_TIMEOUT then break end
+
+        local m = findWildModel(refPart)
+        local prompt = findTamePrompt(m)
+        if prompt then
+            pcall(function() fireproximityprompt(prompt) end)
+            task.wait(0.1)
+            pcall(function() fireproximityprompt(prompt) end)
+        end
+        pcall(function() WildPetTame:Fire(refPart) end)
+        task.wait(0.35)
+
+        if refPart:GetAttribute("OwnerUserId") == lp.UserId then success = true end
+    end
+
+    -- Cleanup: unhook, unanchor, restore humanoid state
+    stopHB = true
+    if hbConn    then pcall(function() hbConn:Disconnect()    end) end
+    if conn      then pcall(function() conn:Disconnect()      end) end
+    if snipeConn then pcall(function() snipeConn:Disconnect() end) end
+    pcall(function()
+        hrp.Anchored      = prevAnchored
+        hum.PlatformStand = false
+        hum.AutoRotate    = prevAutoRot
+    end)
+
+    if success then
+        local rarity = refPart:GetAttribute("Rarity") or "?"
+        local size   = refPart:GetAttribute("PetSize") or "Normal"
+        lastTamedLbl.Text = "Last: " .. displayName
+        setStatus("✓ Tamed " .. displayName, C.accent)
+        setTarget(nil, nil)
+        sendWebhook("✅ Tamed — " .. displayName,
+            "**Pet:** " .. (refPart:GetAttribute("PetName") or "?") ..
+            "\n**Size:** " .. size ..
+            "\n**Rarity:** " .. rarity ..
+            "\n**Price:** " .. price ..
+            "\n**Balance after:** " .. getBalance() ..
+            "\n**Server:** " .. game.JobId:sub(1,8), 5763719)
+        taming = false; return true
+    elseif sniped then
+        setStatus("Sniped — rescanning", C.muted)
+        setTarget(nil, nil)
+        sendWebhook("😞 Sniped — " .. displayName, "**Server:** " .. game.JobId:sub(1,8), 15548997)
+        taming = false; return false
+    else
+        setStatus("Tame failed — rescanning", C.muted)
+        setTarget(nil, nil)
+        taming = false; return false
+    end
+end
+
+local function collectTargets()
+    local map = workspace:FindFirstChild("Map"); if not map then return {} end
+    local ref = map:FindFirstChild("WildPetRef"); if not ref then return {} end
+    local found = {}
+    for _, v in ipairs(ref:GetChildren()) do
+        local ok, displayName = shouldTame(v)
+        if ok then table.insert(found, { part = v, display = displayName }) end
+    end
+    table.sort(found, function(a, b)
+        local ma, mb = getMutationTier(a.part), getMutationTier(b.part)
+        if ma ~= mb then return ma > mb end
+        return getPriority(a.part) < getPriority(b.part)
+    end)
+    return found
+end
+
+-- =====================
+-- SERVER HOP (better full-server filter + retry)
+-- =====================
+local function hopServer()
+    if not running then return end
+    hopping = true; hopCancelled = false
+    countBg.Visible = true
+    for i = HOP_DELAY, 1, -1 do
+        if hopCancelled or not running then
+            countBg.Visible = false; hopping = false; return
+        end
+        countLbl.Text = "No targets — hopping in " .. i .. "s"
+        countBar.Size = UDim2.new(i / HOP_DELAY, 0, 1, 0)
+        setStatus("Hopping in " .. i .. "s — STOP to cancel", C.muted)
+        task.wait(1)
+    end
+    if hopCancelled or not running then
+        countBg.Visible = false; hopping = false; return
+    end
+    countBg.Visible = false
+    setStatus("Hopping...", C.muted)
+
+    -- snapshot of what's in this server before we leave (for log)
+    local available = {}
+    local mapRef = workspace:FindFirstChild("Map")
+    if mapRef then
+        local refFolder = mapRef:FindFirstChild("WildPetRef")
+        if refFolder then
+            for _, v in ipairs(refFolder:GetChildren()) do
+                local petName = v:GetAttribute("PetName") or "?"
+                local rarity  = v:GetAttribute("Rarity") or "?"
+                local size    = v:GetAttribute("PetSize") or ""
+                local pType   = v:GetAttribute("PetType") or ""
+                local display = (size ~= "" and (size .. " ") or "")
+                    .. (pType == "Rainbow" and "Rainbow " or "")
+                    .. petName .. " [" .. rarity .. "]"
+                table.insert(available, display)
+            end
+        end
+    end
+    if lastHopFrom ~= game.JobId then
+        lastHopFrom = game.JobId
+        sendWebhook("🔄 Server Hop",
+            "**From:** " .. game.JobId:sub(1,8) ..
+            "\n**Balance:** " .. getBalance() ..
+            "\n**Pets in server:**\n" .. (#available > 0 and table.concat(available, "\n") or "None"),
+            16776960)
+    end
+
+    -- Persist script across teleport if executor supports it
+    if getgenv then
+        local src = getgenv().__PETFINDER_SRC
+        if src then
+            local q = (syn and syn.queue_on_teleport)
+                or (fluxus and fluxus.queue_on_teleport)
+                or queue_on_teleport
+            if q then pcall(q, src) end
+        end
+    end
+
+    -- Try up to N candidates, skipping anything full/near-full
+    local tried = 0
+    for attempt = 1, 10 do
+        if not running then break end
+        local ok, body = pcall(function()
+            local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(placeId)
+                .. (cursor ~= "" and ("&cursor=" .. cursor) or "")
+            return HttpService:JSONDecode(game:HttpGet(url))
+        end)
+        if ok and body and body.data then
+            cursor = body.nextPageCursor or ""
+            for _, s in ipairs(body.data) do
+                local hasRoom = s.playing and s.maxPlayers
+                    and s.playing >= MIN_PLAYERS
+                    and s.playing <= (s.maxPlayers - FULL_BUFFER)
+                if hasRoom and s.id ~= game.JobId and not visited[s.id] then
+                    visited[s.id] = true
+                    if getgenv then getgenv().__PET_VISITED = visited end
+                    tried = tried + 1
+                    setStatus("TP try " .. tried .. " (" .. s.playing .. "/" .. s.maxPlayers .. ")", C.muted)
+                    local tpOk = pcall(function()
+                        TeleportService:TeleportToPlaceInstance(placeId, s.id, lp)
+                    end)
+                    if tpOk then
+                        -- Wait briefly. If TeleportInitFailed fires it clears `hopping` and we move on.
+                        task.wait(6)
+                        if not hopping then
+                            -- failed, continue to next candidate
+                            hopping = true
+                        else
+                            hopping = false
+                            return
+                        end
+                    end
+                    task.wait(0.5)
+                end
+            end
+            if cursor == "" then
+                -- exhausted page list, reset for next attempt
+                visited = { [game.JobId] = true }
+                cursor  = ""
+            end
+        end
+        task.wait(1.5)
+    end
+
+    -- Fallback: rejoin same place
+    setStatus("All TPs failed — rejoin", C.danger)
+    pcall(function() TeleportService:Teleport(placeId, lp) end)
+    hopping = false
+end
+
+-- =====================
+-- SPAWN LISTENER
+-- =====================
+local map = workspace:WaitForChild("Map", 10)
+if map then
+    local ref = map:WaitForChild("WildPetRef", 10)
+    if ref then
+        ref.ChildAdded:Connect(function(child)
+            if not running or taming or hopping then return end
+            task.wait(0.2)
+            if not child.Parent then return end
+            local ok, displayName = shouldTame(child)
+            if ok then
+                hopCancelled = true; emptyAt = nil
+                task.wait(0.1)
+                hopCancelled = false
+                sendWebhook("🎯 Target Spawned — " .. displayName,
+                    "**Rarity:** " .. (child:GetAttribute("Rarity") or "?") ..
+                    "\n**Price:** " .. (child:GetAttribute("Price") or 0) ..
+                    "\n**Server:** " .. game.JobId:sub(1,8), 16744272)
+                tamePet(child, displayName)
+            end
+        end)
+    end
+end
+
+-- =====================
+-- STARTUP HELPERS
+-- =====================
+sendWebhook("🟢 Pet Finder Started (Mobile)",
+    "**Targets:** Raccoon, Unicorn, GoldenDragonfly\n**Mutations:** Big, Huge, Rainbow\n**Hop delay:** "
+    .. HOP_DELAY .. "s\n**Server:** " .. game.JobId:sub(1,8), 5763719)
+
+local function waitForMap()
+    setStatus("Waiting for map...", C.muted)
+    local m = workspace:WaitForChild("Map", 30); if not m then return false end
+    local r = m:WaitForChild("WildPetRef", 30);   if not r then return false end
+    local sp = m:WaitForChild("WildPetSpawns",30); if not sp then return false end
+    task.wait(2); return true
+end
+
+local function dismissScreens()
+    local pg = lp:WaitForChild("PlayerGui", 10); if not pg then return end
+    local t0 = tick()
+    while tick() - t0 < 20 do
+        local loading = pg:FindFirstChild("LoadingGui")
+        if loading then
+            local frame = loading:FindFirstChild("Variant1Frame")
+            local pressAny = frame and frame:FindFirstChild("InnerFrame")
+                and frame.InnerFrame:FindFirstChild("PressAnyTxt")
+            if pressAny and pressAny.Visible then
+                local vim = game:GetService("VirtualInputManager")
+                pcall(function()
+                    vim:SendMouseButtonEvent(
+                        workspace.CurrentCamera.ViewportSize.X / 2,
+                        workspace.CurrentCamera.ViewportSize.Y * 0.65,
+                        0, true, game, 0)
+                    task.wait(0.1)
+                    vim:SendMouseButtonEvent(
+                        workspace.CurrentCamera.ViewportSize.X / 2,
+                        workspace.CurrentCamera.ViewportSize.Y * 0.65,
+                        0, false, game, 0)
+                end)
+                task.wait(0.5)
+            else task.wait(0.3) end
+        else break end
+        task.wait(0.3)
+    end
+end
+
+local function waitForControl()
+    setStatus("Dismissing screens...", C.muted)
+    task.spawn(dismissScreens)
+    local char = lp.Character or lp.CharacterAdded:Wait()
+    local hum  = char:WaitForChild("Humanoid", 15);          if not hum then return false end
+    local hrp  = char:WaitForChild("HumanoidRootPart", 15);  if not hrp then return false end
+    local t0 = tick()
+    while tick() - t0 < 20 do
+        local st = hum:GetState()
+        if st ~= Enum.HumanoidStateType.None
+        and st ~= Enum.HumanoidStateType.Dead
+        and hum.WalkSpeed > 0 then break end
+        task.wait(0.3)
+    end
+    task.wait(1); return true
+end
+
+-- =====================
+-- MAIN LOOP
+-- =====================
+setStatus("Waiting for map...", C.muted)
+
+task.spawn(function()
+    if not waitForMap() then
+        setStatus("Map load failed", C.danger)
+        sendWebhook("❌ Map Load Failed", "Server: " .. game.JobId:sub(1,8), 15548997)
+        return
+    end
+    if not waitForControl() then
+        setStatus("Character control timeout", C.danger); return
+    end
+    setStatus("Scanning...", C.accent)
+    while running do
+        if not taming and not hopping then
+            local targets = collectTargets()
+            if #targets > 0 then
+                emptyAt = nil; countBg.Visible = false
+                for _, entry in ipairs(targets) do
+                    if not running then break end
+                    if entry.part.Parent and entry.part:GetAttribute("OwnerUserId") == 0 then
+                        sendWebhook("🎯 Target Found — " .. entry.display,
+                            "**Rarity:** " .. (entry.part:GetAttribute("Rarity") or "?") ..
+                            "\n**Price:** " .. (entry.part:GetAttribute("Price") or 0) ..
+                            "\n**Balance:** " .. getBalance() ..
+                            "\n**Server:** " .. game.JobId:sub(1,8), 16744272)
+                        emptyAt = nil
+                        tamePet(entry.part, entry.display)
+                    end
+                end
+            else
+                setStatus("Scanning — no targets", C.muted)
+                if emptyAt == nil then
+                    emptyAt = tick()
+                elseif tick() - emptyAt >= HOP_DELAY then
+                    emptyAt = nil
+                    hopServer()
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+    setStatus("Stopped", C.danger)
+end)
+
+print("[GAG2 PETS · MOBILE] Loaded.")
