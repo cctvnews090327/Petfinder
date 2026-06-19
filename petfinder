@@ -13,7 +13,7 @@
 -- =====================
 -- CONFIG
 -- =====================
-local TARGETS   = { Raccoon = true, Unicorn = true, GoldenDragonfly = true }
+local TARGETS   = { Raccoon = true, Unicorn = true, GoldenDragonfly = true, Bunny = true }
 local MUTATIONS = { Big = true, Huge = true, Rainbow = true }
 local HOP_DELAY     = 6
 local MIN_PLAYERS   = 1
