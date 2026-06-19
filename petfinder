@@ -1,23 +1,21 @@
 -- gag2_pets_mobile.lua
--- GAG2 Pet Finder — MOBILE BUILD
--- Changes from PC version:
---   1. Mobile-sized UI (compact, touch-friendly, draggable header, minimize toggle)
---   2. Fixed "TPs to pet then bounces back" — character is now anchored + CFrame is
---      re-enforced every frame while taming, and the prompt's part is dragged onto us
---      continuously, not just once.
---   3. Server hop now filters out full / near-full servers properly and handles
---      TeleportInitFailed so it auto-skips and tries the next one instead of getting
---      stuck on a full server.
---   4. Removed all gear-mailing logic.
+-- GAG2 Pet Finder — MOBILE BUILD (full)
+-- Fixes vs PC version:
+--   1. Mobile-sized UI, manual touch drag, minimize toggle, safe-area aware
+--   2. TP-back fix: anchor + Heartbeat re-CFrame so the server can't yank you back
+--   3. HoldDuration-aware tame: zero hold locally + fall back to real-time hold,
+--      no more spam-firing that resets the hold timer
+--   4. Server hop filters full servers properly + handles TeleportInitFailed
+--   5. No gear mailing
 
 -- =====================
 -- CONFIG
 -- =====================
-local TARGETS   = { Raccoon = true, Unicorn = true, GoldenDragonfly = true, Bunny = true }
+local TARGETS   = { Raccoon = true, Unicorn = true, GoldenDragonfly = true }
 local MUTATIONS = { Big = true, Huge = true, Rainbow = true }
 local HOP_DELAY     = 6
 local MIN_PLAYERS   = 1
-local FULL_BUFFER   = 2     -- need at least this many free slots to consider a server
+local FULL_BUFFER   = 2     -- need at least this many free slots
 local TAME_TIMEOUT  = 20
 local WEBHOOK_URL   = "https://discord.com/api/webhooks/1516033291961106513/6kc8RXhrvg5SygZM5EsSf-VQEg07KHO6EmiNBVV54y2ZGVh_j1sNH1ueHQZhEuN06Xia"
 local WEBHOOK_ENABLED = true
@@ -79,7 +77,9 @@ local function sendWebhook(title, body, color)
     if not WEBHOOK_ENABLED then return end
     task.spawn(function()
         pcall(function()
-            (request or http_request or syn and syn.request)({
+            local req = request or http_request or (syn and syn.request)
+            if not req then return end
+            req({
                 Url    = WEBHOOK_URL,
                 Method = "POST",
                 Headers = { ["Content-Type"] = "application/json" },
@@ -116,7 +116,7 @@ local RARITY_COLOR = {
 }
 
 -- =====================
--- UI BUILD (mobile sized)
+-- UI BUILD (mobile)
 -- =====================
 local existing = playerGui:FindFirstChild("GAG2_PETS")
 if existing then existing:Destroy() end
@@ -128,29 +128,26 @@ sg.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 sg.IgnoreGuiInset = true
 sg.Parent = playerGui
 
--- Mobile dimensions: narrower, anchored top-right with safe-area padding
 local WIN_W, WIN_H = 210, 250
 local win = Instance.new("Frame")
-win.Size       = UDim2.new(0, WIN_W, 0, WIN_H)
-win.Position   = UDim2.new(1, -(WIN_W + 8), 0, 40)
+win.Size = UDim2.new(0, WIN_W, 0, WIN_H)
+win.Position = UDim2.new(1, -(WIN_W + 8), 0, 40)
 win.BackgroundColor3 = C.bg
-win.BorderSizePixel  = 0
-win.Active     = true
+win.BorderSizePixel = 0
+win.Active = true
 win.ClipsDescendants = true
-win.Parent     = sg
+win.Parent = sg
 local wc = Instance.new("UICorner", win); wc.CornerRadius = UDim.new(0,8)
-local ws = Instance.new("UIStroke",  win); ws.Color = C.border; ws.Thickness = 1
+local ws = Instance.new("UIStroke", win);  ws.Color = C.border; ws.Thickness = 1
 
--- Manual touch drag (Draggable is deprecated on mobile)
+-- Touch-friendly drag (Draggable is deprecated)
 do
     local UIS = game:GetService("UserInputService")
     local dragging, dragStart, startPos
-    local function isHeaderInput(input)
-        return input.UserInputType == Enum.UserInputType.Touch
-            or input.UserInputType == Enum.UserInputType.MouseButton1
-    end
     win.InputBegan:Connect(function(input)
-        if isHeaderInput(input) and input.Position.Y - win.AbsolutePosition.Y < 30 then
+        local touch = input.UserInputType == Enum.UserInputType.Touch
+                   or input.UserInputType == Enum.UserInputType.MouseButton1
+        if touch and (input.Position.Y - win.AbsolutePosition.Y) < 30 then
             dragging = true
             dragStart = input.Position
             startPos  = win.Position
@@ -165,8 +162,7 @@ do
             local d = input.Position - dragStart
             win.Position = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + d.X,
-                startPos.Y.Scale, startPos.Y.Offset + d.Y
-            )
+                startPos.Y.Scale, startPos.Y.Offset + d.Y)
         end
     end)
 end
@@ -212,7 +208,6 @@ end
 local hdr = mkFrame(win, UDim2.new(1,0,0,30), UDim2.new(0,0,0,0), C.header, 8)
 mkLabel(hdr, "🐾  PET FINDER", UDim2.new(1,-100,1,0), UDim2.new(0,10,0,0), C.accent, 11, true)
 
--- Minimize toggle for mobile (saves screen space)
 local minimized = false
 local minBtn = mkBtn(hdr, "—",
     UDim2.new(0,28,0,20), UDim2.new(1,-94,0,5),
@@ -313,11 +308,11 @@ end)
 TeleportService.TeleportInitFailed:Connect(function(player, result, errorMsg)
     if player ~= lp then return end
     setStatus("TP failed — retry", C.muted)
-    hopping = false   -- let main loop try the next server
+    hopping = false
 end)
 
 -- =====================
--- CORE LOGIC
+-- CORE HELPERS
 -- =====================
 local function shouldTame(refPart)
     local petName = refPart:GetAttribute("PetName") or ""
@@ -370,7 +365,7 @@ local function findTamePrompt(model)
 end
 
 -- =====================
--- TAME (mobile-fixed: anchor + continuous re-CFrame to defeat bounce-back)
+-- TAME (HoldDuration-aware + anchored)
 -- =====================
 local function tamePet(refPart, displayName)
     taming = true
@@ -398,7 +393,6 @@ local function tamePet(refPart, displayName)
     local hum  = char and char:FindFirstChildOfClass("Humanoid")
     if not hrp or not hum then taming = false; return false end
 
-    -- Pick a stable anchor position: the pet's model RootPart, or the ref part itself
     local model = findWildModel(refPart)
     local anchorPart = (model and model:FindFirstChild("RootPart")) or refPart
     local function anchorCFrame()
@@ -408,7 +402,6 @@ local function tamePet(refPart, displayName)
         return hrp.CFrame
     end
 
-    -- Save & override character state so the server can't yank us back
     local prevAnchored = hrp.Anchored
     local prevAutoRot  = hum.AutoRotate
     pcall(function() hum.PlatformStand = true end)
@@ -417,17 +410,14 @@ local function tamePet(refPart, displayName)
 
     hrp.CFrame = anchorCFrame()
     task.wait(0.15)
-    hrp.Anchored = true   -- anchor AFTER the initial CFrame so we don't yo-yo
+    hrp.Anchored = true
 
-    -- Heartbeat loop: keep us locked at the anchor + drag prompt's part onto us
     local stopHB = false
     local hbConn
     hbConn = RunService.Heartbeat:Connect(function()
         if stopHB then if hbConn then hbConn:Disconnect() end return end
         if not hrp.Parent then return end
-        -- re-lock our position every frame
         hrp.CFrame = anchorCFrame()
-        -- pull the current prompt's parent onto us so distance checks pass
         local m = findWildModel(refPart)
         local p = findTamePrompt(m)
         if p and p.Parent and p.Parent:IsA("BasePart") then
@@ -436,9 +426,7 @@ local function tamePet(refPart, displayName)
     end)
 
     local success, sniped = false, false
-    local conn = WildPetTameResult.OnClientEvent:Connect(function()
-        success = true
-    end)
+    local conn = WildPetTameResult.OnClientEvent:Connect(function() success = true end)
     local snipeConn
     snipeConn = refPart:GetAttributeChangedSignal("OwnerUserId"):Connect(function()
         local newOwner = refPart:GetAttribute("OwnerUserId")
@@ -450,23 +438,56 @@ local function tamePet(refPart, displayName)
     setStatus("Taming " .. displayName .. "...", C.gold)
     local t0 = tick()
 
+    local lastPrompt, lastFireAt, lastHoldDur = nil, 0, 0
+
     while refPart.Parent and not success and not sniped and running do
         if tick() - t0 > TAME_TIMEOUT then break end
 
         local m = findWildModel(refPart)
         local prompt = findTamePrompt(m)
+
         if prompt then
-            pcall(function() fireproximityprompt(prompt) end)
-            task.wait(0.1)
-            pcall(function() fireproximityprompt(prompt) end)
+            local hd = prompt.HoldDuration or 0
+            local needFire = (prompt ~= lastPrompt)
+                or (tick() - lastFireAt >= (lastHoldDur + 0.4))
+
+            if needFire then
+                -- Strategy A: zero hold locally, fire instantly
+                local prevHold = prompt.HoldDuration
+                pcall(function() prompt.HoldDuration = 0 end)
+                pcall(function() fireproximityprompt(prompt) end)
+                pcall(function() prompt.HoldDuration = prevHold end)
+
+                lastPrompt  = prompt
+                lastFireAt  = tick()
+                lastHoldDur = hd
+
+                -- Strategy B fallback: wait the real hold duration, then fire "release"
+                local waitTime = math.max(hd, 0.2)
+                local elapsed  = 0
+                while elapsed < waitTime
+                    and refPart.Parent and not success and not sniped and running do
+                    task.wait(0.1)
+                    elapsed = elapsed + 0.1
+                    if refPart:GetAttribute("OwnerUserId") == lp.UserId then
+                        success = true; break
+                    end
+                end
+
+                if not success and not sniped and prompt.Parent then
+                    pcall(function() fireproximityprompt(prompt) end)
+                end
+            else
+                task.wait(0.2)
+            end
+        else
+            pcall(function() WildPetTame:Fire(refPart) end)
+            task.wait(0.3)
         end
-        pcall(function() WildPetTame:Fire(refPart) end)
-        task.wait(0.35)
 
         if refPart:GetAttribute("OwnerUserId") == lp.UserId then success = true end
     end
 
-    -- Cleanup: unhook, unanchor, restore humanoid state
     stopHB = true
     if hbConn    then pcall(function() hbConn:Disconnect()    end) end
     if conn      then pcall(function() conn:Disconnect()      end) end
@@ -520,7 +541,7 @@ local function collectTargets()
 end
 
 -- =====================
--- SERVER HOP (better full-server filter + retry)
+-- SERVER HOP
 -- =====================
 local function hopServer()
     if not running then return end
@@ -541,7 +562,6 @@ local function hopServer()
     countBg.Visible = false
     setStatus("Hopping...", C.muted)
 
-    -- snapshot of what's in this server before we leave (for log)
     local available = {}
     local mapRef = workspace:FindFirstChild("Map")
     if mapRef then
@@ -568,7 +588,6 @@ local function hopServer()
             16776960)
     end
 
-    -- Persist script across teleport if executor supports it
     if getgenv then
         local src = getgenv().__PETFINDER_SRC
         if src then
@@ -579,7 +598,6 @@ local function hopServer()
         end
     end
 
-    -- Try up to N candidates, skipping anything full/near-full
     local tried = 0
     for attempt = 1, 10 do
         if not running then break end
@@ -603,11 +621,9 @@ local function hopServer()
                         TeleportService:TeleportToPlaceInstance(placeId, s.id, lp)
                     end)
                     if tpOk then
-                        -- Wait briefly. If TeleportInitFailed fires it clears `hopping` and we move on.
                         task.wait(6)
                         if not hopping then
-                            -- failed, continue to next candidate
-                            hopping = true
+                            hopping = true   -- TeleportInitFailed cleared it; try next
                         else
                             hopping = false
                             return
@@ -617,7 +633,6 @@ local function hopServer()
                 end
             end
             if cursor == "" then
-                -- exhausted page list, reset for next attempt
                 visited = { [game.JobId] = true }
                 cursor  = ""
             end
@@ -625,7 +640,6 @@ local function hopServer()
         task.wait(1.5)
     end
 
-    -- Fallback: rejoin same place
     setStatus("All TPs failed — rejoin", C.danger)
     pcall(function() TeleportService:Teleport(placeId, lp) end)
     hopping = false
@@ -658,7 +672,7 @@ if map then
 end
 
 -- =====================
--- STARTUP HELPERS
+-- STARTUP
 -- =====================
 sendWebhook("🟢 Pet Finder Started (Mobile)",
     "**Targets:** Raccoon, Unicorn, GoldenDragonfly\n**Mutations:** Big, Huge, Rainbow\n**Hop delay:** "
